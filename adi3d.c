@@ -6,9 +6,9 @@
 
 #define Max(a, b) ((a) > (b) ? (a) : (b))
 
-#define nx 384
-#define ny 384
-#define nz 384
+#define nx 320
+#define ny 320
+#define nz 320
 
 void init(double (*a)[ny][nz]);
 

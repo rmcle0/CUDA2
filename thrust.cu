@@ -13,15 +13,39 @@ using namespace std;
 
 #define Max(a, b) ((a) > (b) ? (a) : (b))
 
-#define nx 400
-#define ny 400
-#define nz 400
+#define nx 1024
+#define ny 1024
+#define nz 1024
 
+#define IsInBounds(x,a,b) ((x >= a) && (x <= b))
 #define ind(i, j, k) ((i) * ny * nz + (j) * nz + (k))
 
+/*__device__ __host__ int ind(int i, int j, int k){
+  return ((i) * ny * nz + (j) * nz + (k));
+}*/
+
+class Timer {
+ public:
+  Timer(std::string message) : message(message) {
+    t1 = std::chrono::steady_clock::now();
+  }
+
+  ~Timer() {
+    t2 = std::chrono::steady_clock::now();
+
+    /*std::cout << "section : " << message << " took "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1)
+                     .count()
+              << "[ms]" << std::endl;*/
+  }
+
+  std::string message;
+  std::chrono::steady_clock::time_point t1, t2;
+};
+
 __global__ void average_along_I(double *A) {
-  int j = blockIdx.x * blockDim.x + threadIdx.x;
-  int k = blockIdx.y * blockDim.y + threadIdx.y;
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
 
   if (j > 0 && k > 0 && j < ny - 1 && k < nz - 1) {
     for (int i = 1; i < nx - 1; i++) {
@@ -31,8 +55,8 @@ __global__ void average_along_I(double *A) {
 }
 
 __global__ void average_along_J(double *A) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int k = blockIdx.y * blockDim.y + threadIdx.y;
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
 
   if (i > 0 && k > 0 && i < nx - 1 && k < nz - 1) {
     for (int j = 1; j < ny - 1; j++) {
@@ -40,6 +64,67 @@ __global__ void average_along_J(double *A) {
     }
   }
 }
+
+
+
+
+
+
+
+const int TILE_DIM = 32;
+const int BLOCK_ROWS = 8;
+
+//transpose (j,k) components
+__global__ void transpose(double *A) {
+  
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if ( i < nx && k < nz ) {
+    for (int j = 1; j < k; j++) {
+        thrust::swap(A[ind(i, j, k)], A[ind(i, k, j)]);
+    }
+  }
+}
+
+__global__ void transposeCoalesced(const double *idata, double *odata)
+{
+  __shared__ double tile[TILE_DIM][TILE_DIM];
+
+
+  //Calculating offsets to the beginning of the tile
+  int k = blockIdx.x * TILE_DIM + threadIdx.x;
+  int j = blockIdx.y;
+  int i = blockIdx.z * TILE_DIM + threadIdx.y;
+
+  /* 1111
+     2222
+     1111
+     2222 */
+  for (int q = 0; q < TILE_DIM; q += BLOCK_ROWS){
+     int index  = ind(i+q, j, k);
+     tile[threadIdx.y + q][  threadIdx.x] = idata[index];
+  }
+  __syncthreads();
+
+
+  //Offset to the tile in the output array
+  k = blockIdx.z * TILE_DIM + threadIdx.x;  
+  i = blockIdx.x * TILE_DIM + threadIdx.y;
+
+  for (int q = 0; q < TILE_DIM; q += BLOCK_ROWS){    
+     odata[ind(i + q, j, k)] = tile[threadIdx.x][threadIdx.y + q];
+    }
+}
+
+
+void call_transpose(double* A_device_ptr, double * A_device_T_ptr){
+      transposeCoalesced<<<dim3(nz / 32, ny, nz / 32), dim3(32, BLOCK_ROWS, 1)>>>(
+        A_device_ptr, A_device_T_ptr);
+
+}
+
+
 
 __global__ void average_along_K(double *A, double *partly_reduce) {
   __shared__ double sdata[1024];  // block size
@@ -79,7 +164,7 @@ __global__ void average_along_K(double *A, double *partly_reduce) {
 
 template <typename T>
 struct absolute_value : public unary_function<T, T> {
-  __host__ __device__ T operator()(const T &x) const {
+  __host__ __device__ T operator()(const  T &x) const  {
     return x < T(0) ? -x : x;
   }
 };
@@ -89,20 +174,22 @@ void init(double (*a)[ny][nz]);
 void compare(thrust::host_vector<double> &a1, double (*a2)[ny][nz]);
 
 int main(int argc, char *argv[]) {
+  std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+
   enum ExecPath { Compare, Skip };
 
-  const ExecPath Implementation = Skip;
+  const  ExecPath Implementation = Skip;
 
-  const double MAXEPS = 0.01;
-  const int ITMAX = 100;
+  const  double MAXEPS = 0.0001;
+  const  int ITMAX = 100;
 
-  std::chrono::steady_clock::time_point begin =
-      std::chrono::steady_clock::now();
 
-  std::chrono::steady_clock::time_point t1, t2;
 
   thrust::host_vector<double> A(nx * ny * nz);
-  thrust::device_vector<double> A_device(nx * ny * nz);
+  thrust::device_vector<double> A_device(nx * ny * nz), A_device2(nx * ny * nz), eps_device(nx * ny * nz);
+
+  thrust::device_vector<double> A_device_T(nx * ny * nz);
+
   // thrust::device_vector<double> diff_device(nx * ny * nz, 0);
   thrust::device_vector<double> partly_reduce((nx / 32 + 1) * (ny / 32 + 1), 0);
 
@@ -118,6 +205,10 @@ int main(int argc, char *argv[]) {
   }
 
   for (int it = 1; it <= ITMAX; it++) {
+    std::cout << "it = " << it << std::endl;
+
+    Timer t("Cycle total");
+
     double eps = 0;
 
     double *A_device_ptr = thrust::raw_pointer_cast(A_device.data());
@@ -126,15 +217,13 @@ int main(int argc, char *argv[]) {
 
     // std::cout << "calling I" << std::endl;
 
-    t1 = std::chrono::steady_clock::now();
-    average_along_I<<<dim3(ny / 32 + 1, nz / 32 + 1, 1), dim3(32, 32, 1)>>>(
-        A_device_ptr);
-    cudaDeviceSynchronize();
-    t2 = std::chrono::steady_clock::now();
-    std::cout
-        << "I "
-        << std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()
-        << "[ns]" << std::endl;
+    {
+      Timer t("I");
+
+      average_along_I<<<dim3(nz / 32 + 1, ny / 32 + 1, 1), dim3(32, 32, 1)>>>(
+          A_device_ptr);
+      cudaDeviceSynchronize();
+    }
 
     if (Implementation == Compare) {
       for (int i = 1; i < nx - 1; i++)
@@ -146,15 +235,12 @@ int main(int argc, char *argv[]) {
       compare(A, a);
     }
 
-    t1 = std::chrono::steady_clock::now();
-    average_along_J<<<dim3(nx / 32 + 1, nz / 32 + 1, 1), dim3(32, 32, 1)>>>(
+    {
+    Timer t("J");
+    average_along_J<<<dim3(nz / 32 + 1, nx / 32 + 1, 1), dim3(32, 32, 1)>>>(
         A_device_ptr);
     cudaDeviceSynchronize();
-    t2 = std::chrono::steady_clock::now();
-    std::cout
-        << "J "
-        << std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()
-        << "[ns]" << std::endl;
+   }
 
     if (Implementation == Compare) {
       for (int i = 1; i < nx - 1; i++)
@@ -166,15 +252,52 @@ int main(int argc, char *argv[]) {
       compare(A, a);
     }
 
-    t1 = std::chrono::steady_clock::now();
-    average_along_K<<<dim3(nx / 32 + 1, ny / 32 + 1, 1), dim3(32, 32, 1)>>>(
-        A_device_ptr, partly_reduce_ptr);
-    cudaDeviceSynchronize();
-    t2 = std::chrono::steady_clock::now();
-    std::cout
-        << "K"
-        << std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()
-        << "[ns]" << std::endl;
+
+
+
+
+    double *A_device_T_ptr = thrust::raw_pointer_cast(A_device_T.data());
+    double *A_device2_ptr = thrust::raw_pointer_cast(A_device2.data());
+
+    // Transposing the matrix
+    {
+      Timer t("transpose");
+      call_transpose(A_device_ptr, A_device_T_ptr);
+      cudaDeviceSynchronize();
+    }
+
+    {
+      Timer t("I");
+      average_along_I<<<dim3(nz / 32 + 1, ny / 32 + 1, 1), dim3(32, 32, 1)>>>(
+          A_device_T_ptr);
+      cudaDeviceSynchronize();
+    }
+
+    {
+      Timer t("transpose");
+      call_transpose(A_device_T_ptr, A_device2_ptr);
+      cudaDeviceSynchronize();
+    }
+
+  
+  {
+      Timer t("minus");
+    thrust::transform(A_device.begin(), A_device.end(), A_device2.begin(),
+                      eps_device.begin(), thrust::minus<double>());
+  }
+
+
+  double eps_val = 0;
+  {
+      Timer t("reduce");
+      eps_val =        thrust::transform_reduce(eps_device.begin(), eps_device.end(),  absolute_value<double>(), 0.0,
+                       thrust::maximum<double>());
+  }
+
+    {
+    Timer t("copy");
+    A_device = A_device2;
+    }
 
     if (Implementation == Compare) {
       for (int i = 1; i < nx - 1; i++)
@@ -190,39 +313,34 @@ int main(int argc, char *argv[]) {
       compare(A, a);
     }
 
-    t1 = std::chrono::steady_clock::now();
-    double eps_device =
-        thrust::reduce(partly_reduce.begin(), partly_reduce.end(), 0.0,
-                       thrust::maximum<double>());
-    cudaDeviceSynchronize();
-    t2 = std::chrono::steady_clock::now();
-    std::cout
-        << "reduction"
-        << std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()
-        << "[ns]" << std::endl;
 
-    printf(" IT = %4i   EPS = %14.7E\n, EPS_OLD =  %14.7E", it, eps_device,
-           eps);
-    if (eps_device < MAXEPS) break;
+
+    printf(" IT = %4i   EPS = %14.7E\n, EPS_OLD =  %14.7E", it, eps_val,     eps);
+
+    if (eps_val < MAXEPS) 
+      break;
+
+  //return 0;
+  //break;
   }
 
   printf(" ADI Benchmark Completed.\n");
   printf(" Size            = %4d x %4d x %4d\n", nx, ny, nz);
-  printf(" Iterations      =       %12d\n", ITMAX);
+  printf(" Iteratioms      =       %12d\n", ITMAX);
   printf(" Operation type  =   double precision\n");
 
   printf(" END OF ADI Benchmark\n");
 
   std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-
-  A = A_device;
-
-  std::cout << "Size = " << nx  << "Time difference = "
-            << std::chrono::duration_cast<std::chrono::milliseconds>(end -
-                                                                     begin)
+  std::cout << "Size = " << nx << " Time difference = "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(end -    begin)
                    .count()
             << "[ms]" << std::endl;
 
+
+  A = A_device;
+
+  std::cout << "Size = " << nx << endl; 
   
 
   if (Implementation == Compare) {

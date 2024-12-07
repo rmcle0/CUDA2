@@ -4,9 +4,19 @@ all: default consequential thrust
 
 launch: default consequential thrust 
 	#mpisubmit.pl default 
-	mpisubmit.pl consequential
+	#mpisubmit.pl consequential
+	
+	bsub -o "consequential.txt"  ./consequential
 	bsub -o "thrust.txt" -gpu "num=1:mode=exclusive_process" ./thrust
 
+
+lc:
+	bsub -sp 10000 -oo "consequential.txt"  ./consequential
+
+#launch thrust
+lt:
+	bsub -oo "thrust.txt" -gpu "num=1" ./thrust
+	
 
 default: adi3d.c 
 	gcc adi3d.c $(C_CPP_FLAGS) -o default 
@@ -19,6 +29,7 @@ thrust: thrust.cu
 
 debug_thrust:
 	nvcc -std=c++11 -O0 -G thrust.cu -o thrust
+	cuda-gdb ./thrust
 
 clean:
 	rm -f *.dump *.err *.out .*o *.exe
